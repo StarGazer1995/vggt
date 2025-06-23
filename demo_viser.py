@@ -29,6 +29,7 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+from vggt.utils.pointcloud import read_pcd_bin
 
 
 def viser_wrapper(
@@ -69,13 +70,15 @@ def viser_wrapper(
     # Unpack prediction dict
     images = pred_dict["images"]  # (S, 3, H, W)
     world_points_map = pred_dict["world_points"]  # (S, H, W, 3)
-    conf_map = pred_dict["world_points_conf"]  # (S, H, W)
+    conf_map = pred_dict["world_points_conf"]  # (S, H, W)ˆ
 
     depth_map = pred_dict["depth"]  # (S, H, W, 1)
     depth_conf = pred_dict["depth_conf"]  # (S, H, W)
 
     extrinsics_cam = pred_dict["extrinsic"]  # (S, 3, 4)
     intrinsics_cam = pred_dict["intrinsic"]  # (S, 3, 3)
+    if isinstance(images, torch.Tensor):
+        images = images.detach().cpu().numpy()
 
     # Compute world points from depth if not using the precomputed point map
     if not use_point_map:
@@ -91,6 +94,7 @@ def viser_wrapper(
 
     # Convert images from (S, 3, H, W) to (S, H, W, 3)
     # Then flatten everything for the point cloud
+    print("Images Shape: {}".format(images.shape))
     colors = images.transpose(0, 2, 3, 1)  # now (S, H, W, 3)
     S, H, W, _ = world_points.shape
 
@@ -131,6 +135,18 @@ def viser_wrapper(
         name="viser_pcd",
         points=points_centered[init_conf_mask],
         colors=colors_flat[init_conf_mask],
+        point_size=0.001,
+        point_shape="circle",
+    )
+
+    pcd = read_pcd_bin("/Users/gongzhao/workspace/Ahodgepodge/projects/vggt/test/lidar/n008-2018-05-21-11-06-59-0400__LIDAR_TOP__1526915243097718.pcd.bin", dataset="nuscenes")
+    pcd = pcd[:, :3]
+    pcd = pcd[:, [0, 2, 1]]
+    pcd[:, -2] = -pcd[:, -2]
+    point_cloud = server.scene.add_point_cloud(
+        name='pcd',
+        points=pcd,
+        colors=[255,0,0],
         point_size=0.001,
         point_shape="circle",
     )
@@ -251,6 +267,12 @@ def viser_wrapper(
 
     return server
 
+def local_data(path):
+    data = np.load(path, allow_pickle=True).item()
+    predictions = {}
+    for key, value in data.items():
+        predictions[key] = np.array(value)
+    return predictions
 
 # Helper functions for sky segmentation
 
@@ -316,6 +338,7 @@ parser.add_argument(
     "--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out"
 )
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
+parser.add_argument("--local_data", type=str, default="")
 
 
 def main():
@@ -338,51 +361,56 @@ def main():
     --mask_sky: Apply sky segmentation to filter out sky points
     """
     args = parser.parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    if len(args.local_data) < 1:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
 
-    print("Initializing and loading VGGT model...")
-    # model = VGGT.from_pretrained("facebook/VGGT-1B")
+        print("Initializing and loading VGGT model...")
+        # model = VGGT.from_pretrained("facebook/VGGT-1B")
 
-    model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+        model = VGGT()
+        _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+        model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
 
-    model.eval()
-    model = model.to(device)
+        model.eval()
+        model = model.to(device)
 
-    # Use the provided image folder path
-    print(f"Loading images from {args.image_folder}...")
-    image_names = glob.glob(os.path.join(args.image_folder, "*"))
-    print(f"Found {len(image_names)} images")
+        # Use the provided image folder path
+        print(f"Loading images from {args.image_folder}...")
+        image_names = glob.glob(os.path.join(args.image_folder, "*"))
+        print(f"Found {len(image_names)} images")
 
-    images = load_and_preprocess_images(image_names).to(device)
-    print(f"Preprocessed images shape: {images.shape}")
+        images = load_and_preprocess_images(image_names).to(device)
+        print(f"Preprocessed images shape: {images.shape}")
 
-    print("Running inference...")
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        print("Running inference...")
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images)
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=dtype):
+                predictions = model(images)
 
-    print("Converting pose encoding to extrinsic and intrinsic matrices...")
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
-    predictions["extrinsic"] = extrinsic
-    predictions["intrinsic"] = intrinsic
+        print("Converting pose encoding to extrinsic and intrinsic matrices...")
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+        predictions["extrinsic"] = extrinsic
+        predictions["intrinsic"] = intrinsic
 
-    print("Processing model outputs...")
-    for key in predictions.keys():
-        if isinstance(predictions[key], torch.Tensor):
-            predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension and convert to numpy
+        print("Processing model outputs...")
+        for key in predictions.keys():
+            if isinstance(predictions[key], torch.Tensor):
+                predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension and convert to numpy
 
-    if args.use_point_map:
-        print("Visualizing 3D points from point map")
+        if args.use_point_map:
+            print("Visualizing 3D points from point map")
+        else:
+            print("Visualizing 3D points by unprojecting depth map by cameras")
+
+        if args.mask_sky:
+            print("Sky segmentation enabled - will filter out sky points")
     else:
-        print("Visualizing 3D points by unprojecting depth map by cameras")
+        predictions = local_data(args.local_data)
+        print(predictions.keys())
 
-    if args.mask_sky:
-        print("Sky segmentation enabled - will filter out sky points")
 
     print("Starting viser visualization...")
 
